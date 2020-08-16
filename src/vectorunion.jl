@@ -1,86 +1,90 @@
-struct InlineUnionArray{T1,T2}
-    mask::Vector{UInt8}
-    t1::Vector{T1}
-    t2::Vector{T2}
-end
-
-function InlineUnionArray(v::Vector{U}) where U
-    @assert U isa Union
-    types = Base.uniontypes(U)
-    @assert length(types) == 2
-    T1, T2 = types
-    N = length(v)
-    mask = zeros(UInt8, N)
-    t1 = Vector{T1}(undef, N)
-    t2 = Vector{T2}(undef, N)
-    for n in 1:N
-        el = v[n]
-        if typeof(el) === T1
-            t1[n] = el
-        else
-            mask[n] = UInt8(255)
-            t2[n] = el
-        end
+struct InlineUnionEl{T1,T2}
+    mask::UInt8
+    t1::T1
+    t2::T2
+    InlineUnionEl{T1,T2}(mask::UInt8, x::T1, y::T2) where {T1,T2} = new{T1,T2}(mask, x, y)
+    InlineUnionEl{T1,T2}(x::T1) where {T1,T2} = new{T1,T2}(UInt8(0), x)
+    function InlineUnionEl{T1,T2}(x::T2) where {T1,T2}
+        el = new{T2,T1}(UInt8(0), x)
+        convert(InlineUnionEl{T1,T2}, el)
     end
-    InlineUnionArray{T1,T2}(mask, t1, t2)
 end
-
-function Base.convert(::Type{Vector}, x::InlineUnionArray{T1,T2}) where {T1,T2}
-    N = length(x.mask)
-    v = Vector{Union{T1,T2}}(undef, N)
-    for n=1:N
-        if x.mask[n] == 0
-            v[n] = x.t1[n]
-        else
-            v[n] = x.t2[n]
-        end
-    end
-    v
-end
-
-Base.convert(::Type{InlineUnionArray}, x) = InlineUnionArray(x)
-
-
-function writeas(::Type{Vector{T}}) where T
-    if T isa Union
-        types = Base.uniontypes(T)
-        length(types) == 2 || return Vector{T}
-        (isbitstype(types[1]) && isbitstype(types[2])) || return Vector{T}
-        return InlineUnionArray{types...}
-    end
-    return Vector{T}
-end
-
-
-function write_dataset(f::JLDFile, x::Vector{T}, wsession::JLDWriteSession) where {T}
-    if writeas(typeof(x)) <: InlineUnionArray
-        # Conversion has to be done earlier here because
-        # vectors are special cased in dispatch
-        y = InlineUnionArray(x)
+function Base.convert(::Type{InlineUnionEl{T2,T1}}, x::InlineUnionEl{T1,T2}) where {T1,T2}
+    if x.mask == 0
+        InlineUnionEl{T2,T1}(UInt8(255), x.t2, x.t1)
     else
-        y = x
+        InlineUnionEl{T2,T1}(UInt8(0), x.t2, x.t1)
     end
-    odr = objodr(y)
-    write_dataset(f, WriteDataspace(f, y, odr), h5type(f, y), odr, y, wsession)
+end
+function Base.convert(::Type{InlineUnionEl{T1,T2}}, x::InlineUnionEl{T1,T2}) where {T1,T2}
+    x
 end
 
-
-# This is annoying to have to do conversion here
-# But the problem is that the standard machinery tries to convert
-# elements of a vector at a time instead of the whole thing
-@inline function read_scalar(f::JLDFile{MmapIO}, rr::ReadRepresentation{<:InlineUnionArray}, header_offset::RelOffset)
-    io = f.io
-    inptr = io.curptr
-    obj = jlconvert(rr, f, inptr, header_offset)
-    io.curptr = inptr + odr_sizeof(rr)
-    convert(Vector, obj)
-end
-
-@inline function read_scalar(f::JLDFile{IOStream}, rr::ReadRepresentation{<:InlineUnionArray}, header_offset::RelOffset)
-    r = Vector{UInt8}(undef, odr_sizeof(rr))
-    @GC.preserve r begin
-        unsafe_read(f.io, pointer(r), odr_sizeof(rr))
-        obj = jlconvert(rr, f, pointer(r), header_offset)
+function Base.show(io::IO, iu::InlineUnionEl)
+    print(io, string(typeof(iu)))
+    if iu.mask == 0
+        print(io, ": ", string(iu.t1))
+    else
+        print(io, ": ", string(iu.t2))
     end
-    convert(Vector, obj)
 end
+
+#InlineUnionEl{Float64, Int}(1.0)
+
+
+# Base.convert(::Type{InlineUnionEl{T1,T2}}, x) where {T1,T2}= InlineUnionEl{T1,T2}(x)
+# function Base.convert(::Type, x::InlineUnionEl)
+#     if x.mask == 0
+#         x.t1
+#     else
+#         x.t2
+#     end
+# end
+#
+# function writeas(::Type{Vector{T}}) where T
+#      if T isa Union
+#          types = Base.uniontypes(T)
+#          length(types) == 2 || return Vector{T}
+#          (isbitstype(types[1]) && isbitstype(types[2])) || return Vector{T}
+#          return InlineUnionEl{types...}#InlineUnionArray{types...}
+#      end
+#      return Vector{T}
+# end
+
+function writeas(T::Union)
+    types = Base.uniontypes(T)
+    length(types) == 2 || return T
+    (isbitstype(types[1]) && isbitstype(types[2])) || return T
+    return InlineUnionEl{types...}#InlineUnionArray{types...}
+end
+
+function CustomSerialization(::Type, ::Union, odr)
+    #@info "executed this"
+    odr
+end
+
+function Base.convert(::Union, x::InlineUnionEl)
+    if x.mask == 0
+        x.t1
+    else
+        x.t2
+    end
+end
+
+function h5convert!(out::Pointers,
+    ::OnDiskRepresentation{OFFS,Tuple{UInt8,T1,T2},H5types},
+    f::JLDFile, x::Union{T1,T2}, wsession::JLDWriteSession) where {OFFS, T1,T2, H5types}
+    #error("blb")
+    #@info "also did this"
+    #@show x
+    if x isa T1
+        unsafe_store!(convert(Ptr{UInt8}, out), UInt8(0))
+        h5convert!(out+1, odr(T1), f, x, wsession)
+    else
+        #@show x
+        unsafe_store!(convert(Ptr{UInt8}, out), UInt8(255))
+        h5convert!(out+1+odr_sizeof(T1), odr(T2), f, x, wsession)
+    end
+end
+
+h5convert!(::Ptr, odr::Nothing, ::JLDFile, ::Missing, ::JLDWriteSession) = nothing
